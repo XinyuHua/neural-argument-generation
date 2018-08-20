@@ -1,11 +1,13 @@
+# Main program for train/eval/decode on neural argument generation models.
+
 import time
 import os
 import tensorflow as tf
 import numpy as np
 from data_loader import Batcher
-from vanilla_model import vanillaSeq2seqModel
-from sep_dec_model import separateDecoderModel
-from shd_dec_model import sharedDecoderModel
+from vanilla_model import VanillaSeq2seqModel
+from sep_dec_model import SeparateDecoderModel
+from shd_dec_model import SharedDecoderModel
 from decode import BeamSearchDecoder
 import utils
 import argparse
@@ -51,7 +53,7 @@ args = parser.parse_args()
 
 
 def calc_running_avg_loss(loss, running_avg_loss, summary_writer, step, decay=0.99):
-  if running_avg_loss == 0:  # on the first iteration just take the loss
+  if running_avg_loss == 0:
     running_avg_loss = loss
   else:
     running_avg_loss = running_avg_loss * decay + (1 - decay) * loss
@@ -65,13 +67,13 @@ def calc_running_avg_loss(loss, running_avg_loss, summary_writer, step, decay=0.
 
 def run_eval(model, batcher, ckpt_id):
   model()
-  saver = tf.train.Saver(max_to_keep=3) 
+  saver = tf.train.Saver(max_to_keep=3)
   sess = tf.Session(config=utils.get_config())
-  eval_dir = os.path.join(args.model_path, "eval") 
-  bestmodel_save_path = os.path.join(eval_dir, 'bestmodel') 
+  eval_dir = os.path.join(args.model_path, "eval")
+  bestmodel_save_path = os.path.join(eval_dir, 'bestmodel')
   summary_writer = tf.summary.FileWriter(eval_dir)
-  running_avg_loss = 0 
-  best_loss = None  
+  running_avg_loss = 0
+  best_loss = None
 
   batch_cnt = 0
   while True:
@@ -79,7 +81,7 @@ def run_eval(model, batcher, ckpt_id):
         break
     batch_cnt += 1
     _ = utils.load_ckpt(args, saver, sess, "train", ckpt_id)
-    batch = batcher.next_batch() 
+    batch = batcher.next_batch()
 
     # run eval on the batch
     t0=time.time()
@@ -123,7 +125,7 @@ def setup_training(model, data_loader):
                      saver=saver,
                      summary_op=None,
                      save_summaries_secs=60,
-                     save_model_secs=args.save_model_seconds, 
+                     save_model_secs=args.save_model_seconds,
                      global_step=model.global_step)
   summary_writer = sv.summary_writer
   tf.logging.info("Preparing or waiting for session...")
@@ -139,7 +141,7 @@ def setup_training(model, data_loader):
 def run_training(model, data_loader, sess_context_manager, summary_writer):
   tf.logging.info("starting run_training")
   with sess_context_manager as sess:
-    while True: # repeats until interrupted
+    while True:
       batch = data_loader.next_batch()
 
       tf.logging.info('running training step...')
@@ -149,17 +151,16 @@ def run_training(model, data_loader, sess_context_manager, summary_writer):
       tf.logging.info('seconds for training step: %.3f', t1-t0)
 
       loss = results['loss']
-      tf.logging.info('loss: %f', loss) # print the loss to screen
+      tf.logging.info('loss: %f', loss)
 
       if not np.isfinite(loss):
         raise Exception("Loss is not finite. Stopping.")
-      # get the summaries and iteration number so we can write summaries to tensorboard
 
-      summaries = results['summaries'] # we will write these summaries to tensorboard using summary_writer
-      train_step = results['global_step'] # we need this to update our running average loss
+      summaries = results['summaries']
+      train_step = results['global_step']
 
-      summary_writer.add_summary(summaries, train_step) # write the summaries
-      if train_step % 100 == 0: # flush the summary writer every so often
+      summary_writer.add_summary(summaries, train_step)
+      if train_step % 100 == 0:
         summary_writer.flush()
       if train_step > args.max_training_steps:
         break
@@ -167,10 +168,9 @@ def run_training(model, data_loader, sess_context_manager, summary_writer):
 
 def main():
 
-  tf.logging.set_verbosity(tf.logging.INFO) # choose what level of logging you want
+  tf.logging.set_verbosity(tf.logging.INFO)
   tf.logging.info('Starting seq2seq_attention in %s mode...', (args.mode))
 
-  # Change log_root to FLAGS.log_root/FLAGS.exp_name and create the dir if necessary
   args.model_path = os.path.join(args.model_path, args.exp_name)
   if not os.path.exists(args.model_path):
     if args.mode=="train":
@@ -178,31 +178,28 @@ def main():
     else:
       raise Exception("Logdir %s doesn't exist. Run in train mode to create it." % (args.model_path))
 
-  src_vocab = utils.Vocab(args.src_vocab_path, args.src_vocab_size) # create a vocabulary
-  tgt_vocab = utils.Vocab(args.tgt_vocab_path, args.tgt_vocab_size)  # create a vocabulary
-  if args.mode == 'decode':
-    args.batch_size = args.beam_size
-
-  if args.model == "vanilla":
-    model_class = vanillaSeq2seqModel
-  elif args.model == "sep_dec":
-    model_class = separateDecoderModel
-  elif args.model == "shd_dec":
-    model_class = sharedDecoderModel
-
-  # Create a batcher object that will create minibatches of data
+  src_vocab = utils.Vocab(args.src_vocab_path, args.src_vocab_size)
+  tgt_vocab = utils.Vocab(args.tgt_vocab_path, args.tgt_vocab_size)
   batcher = Batcher(args.data_path, src_vocab, tgt_vocab, args)
 
-  tf.set_random_seed(111) # a seed value for randomness
+  if args.model == "vanilla":
+    model_class = VanillaSeq2seqModel
+  elif args.model == "sep_dec":
+    model_class = SeparateDecoderModel
+  elif args.model == "shd_dec":
+    model_class = SharedDecoderModel
+
+
+  tf.set_random_seed(111)
 
   if args.mode == 'train':
-    print("creating model...")
     model = model_class(args, src_vocab, tgt_vocab)
     setup_training(model, batcher)
   elif args.mode == 'eval':
     model = model_class(args, src_vocab, tgt_vocab)
     run_eval(model, batcher, args.ckpt_id)
   elif args.mode == "decode":
+    args.batch_size = args.beam_size
     args.arg_max_dec_steps = 1
     args.kp_max_dec_steps = 1
     model = model_class(args, src_vocab, tgt_vocab)

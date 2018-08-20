@@ -1,8 +1,9 @@
+"""Definition of the base model class, which is inherited by concrete model classes."""
 import os
 import time
+import codecs
 import numpy as np
 import tensorflow as tf
-import codecs
 
 
 def load_embed_txt(embed_file, vocab):
@@ -12,7 +13,7 @@ def load_embed_txt(embed_file, vocab):
         for line in f:
             tokens = line.strip().split(" ")
             word = tokens[0]
-            if not word in vocab._word_to_id: continue
+            if word not in vocab._word_to_id: continue
             vec = list(map(float, tokens[1:]))
             emb_dict[word] = vec
             if emb_size:
@@ -37,7 +38,6 @@ def _create_pretrained_emb_from_vocab(vocab, embed_file, dtype=tf.float32, name=
     emb_size = emb_mat.shape[1]
     emb_mat = tf.constant(emb_mat)
     emb_mat_const = tf.slice(emb_mat, [num_trainable_tokens, 0], [-1, -1])
-    # with tf.variable_scope(scope or "pretrain_embeddings", dtype=dtype) as scope:
     emb_mat_var = tf.get_variable(name, [num_trainable_tokens, emb_size])
     return tf.concat([emb_mat_var, emb_mat_const], 0)
 
@@ -48,7 +48,9 @@ class baseModel(object):
         self.hps = hps
         self._src_vocab = src_vocab
         self._tgt_vocab = tgt_vocab
-
+        self.arg_dec_outputs = None
+        self._dec_out_state = None
+        self.attn_dists = None
 
     def __call__(self):
         print("[*] Building graph...")
@@ -67,29 +69,41 @@ class baseModel(object):
         # encoder part
         self._enc_batch = tf.placeholder(tf.int32, [self.hps.batch_size, None], name='enc_batch')
         self._enc_lens = tf.placeholder(tf.int32, [self.hps.batch_size], name='enc_lens')
-        self._enc_padding_mask = tf.placeholder(tf.float32, [self.hps.batch_size, None], name='enc_padding_mask')
+        self._enc_padding_mask = tf.placeholder(tf.float32, [self.hps.batch_size, None],
+                                                name='enc_padding_mask')
         # decoder part
-        self._arg_dec_batch = tf.placeholder(tf.int32, [self.hps.batch_size, self.hps.arg_max_dec_steps], name='arg_dec_batch')
-        self._arg_target_batch = tf.placeholder(tf.int32, [self.hps.batch_size, self.hps.arg_max_dec_steps], name='arg_target_batch')
-        self._arg_dec_padding_mask = tf.placeholder(tf.float32, [self.hps.batch_size, self.hps.arg_max_dec_steps],
-                                                name='arg_dec_padding_mask')
+        self._arg_dec_batch = tf.placeholder(tf.int32,
+                                             [self.hps.batch_size, self.hps.arg_max_dec_steps],
+                                             name='arg_dec_batch')
+        self._arg_target_batch = tf.placeholder(tf.int32,
+                                                [self.hps.batch_size, self.hps.arg_max_dec_steps],
+                                                name='arg_target_batch')
+        self._arg_dec_padding_mask = \
+            tf.placeholder(tf.float32, [self.hps.batch_size, self.hps.arg_max_dec_steps],
+                           name='arg_dec_padding_mask')
 
         # add placeholder for kp decoder if necessary
         if self.hps.model in  ["sep_dec", "shd_dec"]:
-            self._kp_dec_batch = tf.placeholder(tf.int32, [self.hps.batch_size, self.hps.kp_max_dec_steps],
-                                                 name='kp_dec_batch')
-            self._kp_target_batch = tf.placeholder(tf.int32, [self.hps.batch_size, self.hps.kp_max_dec_steps],
-                                                    name='kp_target_batch')
-            self._kp_dec_padding_mask = tf.placeholder(tf.float32, [self.hps.batch_size, self.hps.kp_max_dec_steps],
-                                                        name='kp_dec_padding_mask')
+            self._kp_dec_batch = tf.placeholder(tf.int32,
+                                                [self.hps.batch_size, self.hps.kp_max_dec_steps],
+                                                name='kp_dec_batch')
+            self._kp_target_batch = tf.placeholder(tf.int32,
+                                                   [self.hps.batch_size, self.hps.kp_max_dec_steps],
+                                                   name='kp_target_batch')
+            self._kp_dec_padding_mask = \
+                tf.placeholder(tf.float32, [self.hps.batch_size, self.hps.kp_max_dec_steps],
+                               name='kp_dec_padding_mask')
         self._initial_attention = tf.placeholder_with_default(tf.constant(False), shape=[])
 
     def _add_model(self):
         with tf.variable_scope("seq2seq_model"):
             # Some initializers
-            self.rand_unif_init = tf.random_uniform_initializer(-self.hps.rand_unif_init_mag, self.hps.rand_unif_init_mag,
-                                                                seed=123)
-            self.trunc_norm_init = tf.truncated_normal_initializer(stddev=self.hps.trunc_norm_init_std)
+            self.rand_unif_init = \
+                tf.random_uniform_initializer(-self.hps.rand_unif_init_mag,
+                                              self.hps.rand_unif_init_mag,
+                                              seed=123)
+            self.trunc_norm_init = \
+                tf.truncated_normal_initializer(stddev=self.hps.trunc_norm_init_std)
 
             # Add embedding matrix (shared by the encoder and decoder inputs)
             with tf.variable_scope('embedding'):
@@ -106,58 +120,64 @@ class baseModel(object):
                 self._add_output_projection()
             if self.hps.mode in ["train", "eval"]:
                 with tf.variable_scope("loss"):
-                    self._loss_arg = tf.contrib.seq2seq.sequence_loss(tf.stack(self.arg_dec_vocab_scores, axis=1),
-                                                                    self._arg_target_batch,
-                                                                    self._arg_dec_padding_mask)  # this applies softmax internally
+                    self._loss_arg = tf.contrib.seq2seq.sequence_loss(
+                        tf.stack(self.arg_dec_vocab_scores, axis=1),
+                        self._arg_target_batch, self._arg_dec_padding_mask)
                     self._loss = self._loss_arg
 
                     if self.hps.model in ["sep_dec", "shd_dec"]:
-                        self._loss_kp = tf.contrib.seq2seq.sequence_loss(tf.stack(self.kp_dec_vocab_scores, axis=1),
-                                                                        self._kp_target_batch,
-                                                                        self._kp_dec_padding_mask)  # this applies softmax internally
+                        self._loss_kp = tf.contrib.seq2seq.sequence_loss(
+                            tf.stack(self.kp_dec_vocab_scores, axis=1),
+                            self._kp_target_batch, self._kp_dec_padding_mask)
                         self._loss += self._loss_kp
                         tf.summary.scalar('loss_kp', self._loss_kp)
 
                     tf.summary.scalar('loss', self._loss)
                     tf.summary.scalar('loss_arg', self._loss_arg)
             else:
-                assert len(self.arg_dec_vocab_dists) == 1  # final_dists is a singleton list containing shape (batch_size, extended_vsize)
+                assert len(self.arg_dec_vocab_dists) == 1
                 topk_probs_arg, self._topk_ids_arg = tf.nn.top_k(self.arg_dec_vocab_dists[0],
-                                                             self.hps.batch_size * 2 + 1)  # take the k largest probs. note batch_size=beam_size in decode mode
+                                                                 self.hps.batch_size * 2 + 1)
                 self._topk_log_probs_arg = tf.log(topk_probs_arg)
 
                 if self.hps.model in ["sep_dec", "shd_dec"]:
                     assert len(self.kp_dec_vocab_dists) == 1
                     topk_probs_kp, self._topk_ids_kp = tf.nn.top_k(self.kp_dec_vocab_dists[0],
-                                                                 self.hps.batch_size * 2 + 1)  # take the k largest probs. note batch_size=beam_size in decode mode
+                                                                   self.hps.batch_size * 2 + 1)
 
                     self._topk_log_probs_kp = tf.log(topk_probs_kp)
 
 
-
-
     def _add_embedding(self):
         if os.path.exists(self.hps.embed_path):
-          embedding_encoder = _create_pretrained_emb_from_vocab(self._src_vocab, self.hps.embed_path,
-                                                              name="embedding_src")
-          embedding_decoder = _create_pretrained_emb_from_vocab(self._tgt_vocab, self.hps.embed_path,
-                                                              name="embedding_tgt")
+            embedding_encoder = _create_pretrained_emb_from_vocab(
+                self._src_vocab, self.hps.embed_path, name="embedding_src")
+            embedding_decoder = _create_pretrained_emb_from_vocab(
+                self._tgt_vocab, self.hps.embed_path, name="embedding_tgt")
         else:
-          embedding_encoder = tf.get_variable('embedding_src', [self._src_vocab.size(), self.hps.emb_dim], dtype=tf.float32,
-                                              initializer=self.trunc_norm_init)
-          embedding_decoder = tf.get_variable('embedding_tgt', [self._tgt_vocab.size(), self.hps.emb_dim], dtype=tf.float32,
-                                              initializer=self.trunc_norm_init)
+            embedding_encoder = tf.get_variable('embedding_src',
+                                                [self._src_vocab.size(), self.hps.emb_dim],
+                                                dtype=tf.float32,
+                                                initializer=self.trunc_norm_init)
+            embedding_decoder = tf.get_variable('embedding_tgt',
+                                                [self._tgt_vocab.size(), self.hps.emb_dim],
+                                                dtype=tf.float32,
+                                                initializer=self.trunc_norm_init)
 
-        self.emb_enc_inputs = tf.nn.embedding_lookup(embedding_encoder, self._enc_batch) # tensor with shape (batch_size, max_enc_steps, emb_size)
-        self.emb_arg_dec_inputs = [tf.nn.embedding_lookup(embedding_decoder, x) for x in tf.unstack(self._arg_dec_batch, axis=1)] # list length max_dec_steps containing shape (batch_size, emb_size)
+        self.emb_enc_inputs = tf.nn.embedding_lookup(embedding_encoder, self._enc_batch)
+        self.emb_arg_dec_inputs = [tf.nn.embedding_lookup(embedding_decoder, x)
+                                   for x in tf.unstack(self._arg_dec_batch, axis=1)]
         if self.hps.model in ["sep_dec", "shd_dec"]:
-            self.emb_kp_dec_inputs = [tf.nn.embedding_lookup(embedding_decoder, x) for x in tf.unstack(self._kp_dec_batch, axis=1)] # list length max_dec_steps containing shape (batch_size, emb_size)
+            self.emb_kp_dec_inputs = [tf.nn.embedding_lookup(embedding_decoder, x)
+                                      for x in tf.unstack(self._kp_dec_batch, axis=1)]
 
 
     def _add_train_op(self):
         loss_to_minimize = self._loss
         tvars = tf.trainable_variables()
-        gradients = tf.gradients(loss_to_minimize, tvars, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE)
+        gradients = tf.gradients(
+            loss_to_minimize, tvars,
+            aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE)
 
         # Clip the gradients
         grads, global_norm = tf.clip_by_global_norm(gradients, self.hps.max_grad_norm)
@@ -169,18 +189,25 @@ class baseModel(object):
         if self.hps.optimizer == "adam":
             optimizer = tf.train.AdamOptimizer(self.hps.learning_rate)
         else:
-            optimizer = tf.train.AdagradOptimizer(0.15, initial_accumulator_value=self.hps.adagrad_init_acc)
+            optimizer =\
+                tf.train.AdagradOptimizer(0.15,
+                                          initial_accumulator_value=self.hps.adagrad_init_acc)
 
-        self._train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=self.global_step, name='train_step')
+        self._train_op = optimizer.apply_gradients(
+            zip(grads, tvars), global_step=self.global_step, name='train_step')
 
     def _add_output_projection(self):
         with tf.variable_scope('arg_dec_output_projection'):
-            w = tf.get_variable('w1', [self.hps.hidden_dim, self._tgt_vocab.size()], dtype=tf.float32, initializer=self.trunc_norm_init)
-            v = tf.get_variable('v1', [self._tgt_vocab.size()], dtype=tf.float32, initializer=self.trunc_norm_init)
+            w = tf.get_variable('w1', [self.hps.hidden_dim, self._tgt_vocab.size()],
+                                dtype=tf.float32, initializer=self.trunc_norm_init)
+            v = tf.get_variable('v1', [self._tgt_vocab.size()],
+                                dtype=tf.float32, initializer=self.trunc_norm_init)
 
-            arg_dec_flattened = tf.reshape(tf.stack(self.arg_dec_outputs), [-1, self.hps.hidden_dim])
+            arg_dec_flattened = tf.reshape(
+                tf.stack(self.arg_dec_outputs), [-1, self.hps.hidden_dim])
             arg_dec_vocab_scores = tf.nn.xw_plus_b(arg_dec_flattened, w, v)
-            arg_dec_vocab_scores = tf.reshape(arg_dec_vocab_scores, [-1, self.hps.batch_size, self._tgt_vocab.size()])
+            arg_dec_vocab_scores = tf.reshape(arg_dec_vocab_scores,
+                                              [-1, self.hps.batch_size, self._tgt_vocab.size()])
             arg_dec_vocab_dists = tf.nn.softmax(arg_dec_vocab_scores)
 
             self.arg_dec_vocab_scores = tf.unstack(arg_dec_vocab_scores)
@@ -188,10 +215,11 @@ class baseModel(object):
 
         if self.hps.model in ["sep_dec", "shd_dec"]:
             with tf.variable_scope('kp_dec_output_projection'):
-                kp_dec_flattened = tf.reshape(tf.stack(self.kp_dec_outputs), [-1, self.hps.hidden_dim])
+                kp_dec_flattened = tf.reshape(
+                    tf.stack(self.kp_dec_outputs), [-1, self.hps.hidden_dim])
                 kp_dec_vocab_scores = tf.nn.xw_plus_b(kp_dec_flattened, w, v)
                 kp_dec_vocab_scores = tf.reshape(kp_dec_vocab_scores,
-                                                  [-1, self.hps.batch_size, self._tgt_vocab.size()])
+                                                 [-1, self.hps.batch_size, self._tgt_vocab.size()])
                 kp_dec_vocab_dists = tf.nn.softmax(kp_dec_vocab_scores)
 
                 self.kp_dec_vocab_scores = tf.unstack(kp_dec_vocab_scores)
@@ -208,45 +236,53 @@ class baseModel(object):
         cell_bw2 = tf.contrib.rnn.LSTMCell(self.hps.hidden_dim, initializer=self.rand_unif_init,
                                            state_is_tuple=True)
         if self.hps.dropout > 0.0:
-            cell_fw1 = tf.contrib.rnn.DropoutWrapper(cell=cell_fw1, input_keep_prob=(1 - self.hps.dropout))
-            cell_bw1 = tf.contrib.rnn.DropoutWrapper(cell=cell_bw1, input_keep_prob=(1 - self.hps.dropout))
-            cell_fw2 = tf.contrib.rnn.DropoutWrapper(cell=cell_fw2, input_keep_prob=(1 - self.hps.dropout))
-            cell_bw2 = tf.contrib.rnn.DropoutWrapper(cell=cell_bw2, input_keep_prob=(1 - self.hps.dropout))
+            cell_fw1 = tf.contrib.rnn.DropoutWrapper(cell=cell_fw1,
+                                                     input_keep_prob=(1 - self.hps.dropout))
+            cell_bw1 = tf.contrib.rnn.DropoutWrapper(cell=cell_bw1,
+                                                     input_keep_prob=(1 - self.hps.dropout))
+            cell_fw2 = tf.contrib.rnn.DropoutWrapper(cell=cell_fw2,
+                                                     input_keep_prob=(1 - self.hps.dropout))
+            cell_bw2 = tf.contrib.rnn.DropoutWrapper(cell=cell_bw2,
+                                                     input_keep_prob=(1 - self.hps.dropout))
         cell_fw = tf.contrib.rnn.MultiRNNCell([cell_fw1, cell_fw2])
         cell_bw = tf.contrib.rnn.MultiRNNCell([cell_bw1, cell_bw2])
-        (bi_outputs, (bi_fw_st, bi_bw_st)) = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw, self.emb_enc_inputs,
-                                                                             dtype=tf.float32,
-                                                                             sequence_length=self._enc_lens ,
-                                                                             swap_memory=True)
+        (bi_outputs, (bi_fw_st, bi_bw_st)) = \
+            tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw,
+                                            self.emb_enc_inputs, dtype=tf.float32,
+                                            sequence_length=self._enc_lens, swap_memory=True)
 
         # concatenate state of two layers
         bi_fw_st_conc = tf.concat(axis=2, values=[bi_fw_st[0], bi_fw_st[1]])
         bi_bw_st_conc = tf.concat(axis=2, values=[bi_bw_st[0], bi_bw_st[1]])
         self.bi_fw_st_conc = tf.contrib.rnn.LSTMStateTuple(c=bi_fw_st_conc[0], h=bi_fw_st_conc[1])
         self.bi_bw_st_conc = tf.contrib.rnn.LSTMStateTuple(c=bi_bw_st_conc[0], h=bi_bw_st_conc[1])
-        self.encoder_outputs = tf.concat(axis=2, values=bi_outputs)  # concatenate the forwards and backwards states
+        self.encoder_outputs = tf.concat(axis=2, values=bi_outputs)
 
 
     def _reduce_states(self):
-        w_reduce_c = tf.get_variable('w_reduce_c', [self.hps.hidden_dim * 4, self.hps.hidden_dim * 2], dtype=tf.float32,
-                                     initializer=self.trunc_norm_init)
-        w_reduce_h = tf.get_variable('w_reduce_h', [self.hps.hidden_dim * 4, self.hps.hidden_dim * 2], dtype=tf.float32,
-                                     initializer=self.trunc_norm_init)
-        bias_reduce_c = tf.get_variable('bias_reduce_c', [self.hps.hidden_dim * 2], dtype=tf.float32,
+        w_reduce_c = tf.get_variable('w_reduce_c',
+                                     [self.hps.hidden_dim * 4, self.hps.hidden_dim * 2],
+                                     dtype=tf.float32, initializer=self.trunc_norm_init)
+        w_reduce_h = tf.get_variable('w_reduce_h',
+                                     [self.hps.hidden_dim * 4, self.hps.hidden_dim * 2],
+                                     dtype=tf.float32, initializer=self.trunc_norm_init)
+        bias_reduce_c = tf.get_variable('bias_reduce_c',
+                                        [self.hps.hidden_dim * 2], dtype=tf.float32,
                                         initializer=self.trunc_norm_init)
-        bias_reduce_h = tf.get_variable('bias_reduce_h', [self.hps.hidden_dim * 2], dtype=tf.float32,
+        bias_reduce_h = tf.get_variable('bias_reduce_h',
+                                        [self.hps.hidden_dim * 2], dtype=tf.float32,
                                         initializer=self.trunc_norm_init)
 
         # Apply linear layer
-        old_c = tf.concat(axis=1, values=[self.bi_fw_st_conc.c, self.bi_bw_st_conc.c])  # Concatenation of fw and bw cell
-        old_h = tf.concat(axis=1, values=[self.bi_fw_st_conc.h, self.bi_bw_st_conc.h])  # Concatenation of fw and bw state
-        new_c = tf.nn.relu(tf.matmul(old_c, w_reduce_c) + bias_reduce_c)  # Get new cell from old cell
-        new_h = tf.nn.relu(tf.matmul(old_h, w_reduce_h) + bias_reduce_h)  # Get new state from old state
+        old_c = tf.concat(axis=1, values=[self.bi_fw_st_conc.c, self.bi_bw_st_conc.c])
+        old_h = tf.concat(axis=1, values=[self.bi_fw_st_conc.h, self.bi_bw_st_conc.h])
+        new_c = tf.nn.relu(tf.matmul(old_c, w_reduce_c) + bias_reduce_c)
+        new_h = tf.nn.relu(tf.matmul(old_h, w_reduce_h) + bias_reduce_h)
         new_c_1, new_c_2 = tf.split(new_c, [self.hps.hidden_dim, self.hps.hidden_dim], 1)
         new_h_1, new_h_2 = tf.split(new_h, [self.hps.hidden_dim, self.hps.hidden_dim], 1)
 
         self._dec_in_state = tuple([tf.contrib.rnn.LSTMStateTuple(new_c_1, new_h_1),
-                      tf.contrib.rnn.LSTMStateTuple(new_c_2, new_h_2)])  # Return new cell and state
+                                    tf.contrib.rnn.LSTMStateTuple(new_c_2, new_h_2)])
 
     def _add_decoder(self):
         raise NotImplementedError("Subclasses should implement this!")
@@ -281,19 +317,18 @@ class baseModel(object):
 
     def run_encoder(self, sess, batch):
         feed_dict = self._make_feed_dict(batch, just_enc=True)
-        (enc_states, dec_in_state, global_step) = sess.run([self.encoder_outputs, self._dec_in_state, self.global_step],
-                                                           feed_dict)
+        (enc_states, dec_in_state, global_step) = \
+            sess.run([self.encoder_outputs, self._dec_in_state, self.global_step], feed_dict)
 
         dec_in_state = (tf.contrib.rnn.LSTMStateTuple(dec_in_state[0].c[0], dec_in_state[0].h[0]),
                         tf.contrib.rnn.LSTMStateTuple(dec_in_state[1].c[0], dec_in_state[1].h[0]))
         return enc_states, dec_in_state
 
-    def decode_onestep(self, sess, batch, latest_tokens, enc_states, kp_dec_states, dec_init_states,
-                       arm, first_step=False):
+    def decode_onestep(self, sess, batch, latest_tokens, enc_states,
+                       kp_dec_states, dec_init_states, arm, first_step=False):
 
         beam_size = len(dec_init_states)
 
-        # Turn dec_init_states (a list of LSTMStateTuples) into a single LSTMStateTuple for the batch
         cells_0 = [np.expand_dims(state[0].c, axis=0) for state in dec_init_states]
         hiddens_0 = [np.expand_dims(state[0].h, axis=0) for state in dec_init_states]
         new_c_0 = np.concatenate(cells_0, axis=0)  # shape [batch_size,hidden_dim]
@@ -302,8 +337,8 @@ class baseModel(object):
         hiddens_1 = [np.expand_dims(state[1].h, axis=0) for state in dec_init_states]
         new_c_1 = np.concatenate(cells_1, axis=0)  # shape [batch_size,hidden_dim]
         new_h_1 = np.concatenate(hiddens_1, axis=0)  # shape [batch_size,hidden_dim]
-        new_dec_in_state = (
-        tf.contrib.rnn.LSTMStateTuple(new_c_0, new_h_0), tf.contrib.rnn.LSTMStateTuple(new_c_1, new_h_1))
+        new_dec_in_state = (tf.contrib.rnn.LSTMStateTuple(new_c_0, new_h_0),
+                            tf.contrib.rnn.LSTMStateTuple(new_c_1, new_h_1))
 
         feed = {
             self.encoder_outputs: enc_states,
@@ -330,7 +365,6 @@ class baseModel(object):
                 feed[self._kp_dec_batch] = np.transpose(np.array([latest_tokens]))
             elif self.hps.model == "shd_dec":
                 feed[self._dec_out_state[1]] = new_dec_in_state
-                # feed[self._kp_dec_out_state] = new_dec_in_state
             to_return = {
                 "ids": self._topk_ids_arg,
                 "probs": self._topk_log_probs_arg,
@@ -343,13 +377,13 @@ class baseModel(object):
                 feed[self.kp_dec_padding_mask] = kp_dec_states[1]
                 to_return['dual_attn_dists'] = self.attn_dists[2]
 
-
         results = sess.run(to_return, feed_dict=feed)
         new_states = [
-            (tf.contrib.rnn.LSTMStateTuple(results['last_states'][0].c[i, :], results['last_states'][0].h[i, :]),
-             tf.contrib.rnn.LSTMStateTuple(results['last_states'][1].c[i, :], results['last_states'][1].h[i, :])) for i
-            in range(beam_size)]
-
+            (tf.contrib.rnn.LSTMStateTuple(results['last_states'][0].c[i, :],
+                                           results['last_states'][0].h[i, :]),
+             tf.contrib.rnn.LSTMStateTuple(results['last_states'][1].c[i, :],
+                                           results['last_states'][1].h[i, :]))
+            for i in range(beam_size)]
 
         if "dec_states" in results:
             dec_states = results['dec_states'].tolist()
