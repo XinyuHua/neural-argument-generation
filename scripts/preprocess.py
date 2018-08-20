@@ -1,5 +1,5 @@
 # Author: Xinyu Hua
-# Last modified: 2018-08-13
+# Last modified: 2018-08-20
 """
 Process plain text data into binary format.
 """
@@ -30,7 +30,7 @@ def create_bin(path, data_split):
     assert len(enc_dat) == len(dec_arg_dat), "Lengths of encoder source and decoder target do not match!"
     assert len(dec_arg_dat) == len(dec_kp_dat), "Lengths of decoder argument and decoder keyphrase do not match!"
 
-    output_path = path + data_split + ".bin"
+    output_path = path + "bin/" + data_split + ".bin"
     with open(output_path, "wb") as fout:
         for idx, op in enumerate(enc_op_dat):
             evd = enc_evd_dat[idx]
