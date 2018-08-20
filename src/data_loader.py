@@ -1,50 +1,55 @@
-# Author: Xinyu Hua <hua.x@husky.neu.edu>
-# Last modified: 2018-07-30
-
 from random import shuffle
-import Queue
+import queue
 import tensorflow as tf
 import time
-import os
-import sys
 import utils
 import numpy as np
+from threading import Thread
 
 class DataSample(object):
 
-    def __init__(self, src_txt, tgt_txt, src_vocab, tgt_vocab, hps):
-        """
-        Args:
-            src_txt: tokenized string of source input, each token is separated by one single space.
-            tgt_txt: 
-            src_vocab: Vocabulary for source input.
-            tgt_vocab: Vocabulary for target output.
-            hps: hyperparameters.
-        """
+    def __init__(self, op_txt, evd_txt, kp_sents, arg_sents, src_vocab, tgt_vocab, hps):
         self.hps = hps
 
-        start_decoding = tgt_vocab.word2id()
-        stop_decoding = tgt_vocab.word2id()
+        # Get ids of special tokens
+        arg_start_decoding = tgt_vocab.word2id(utils.ARG_START_DECODING)
+        arg_stop_decoding = tgt_vocab.word2id(utils.ARG_STOP_DECODING)
+        kp_start_decoding = tgt_vocab.word2id(utils.KP_START_DECODING)
+        kp_stop_decoding = tgt_vocab.word2id(utils.KP_STOP_DECODING)
 
         # tokenize the source input
-        src_lst = src_txt.split()
+        op_lst = op_txt.split()
+        evd_lst = evd_txt.split()
+        src_lst = op_lst
+        if hps.model == "base_enc_evd":
+            src_lst += ["<ctx>"] + evd_lst
+        elif hps.model == "base_enc_kp":
+            src_lst += ["<ctx>", "<sent_ctx>"] + "</sent_ctx> <sent_ctx>".join(kp_sents).split() + ["</sent_ctx>"]
+
         if len(src_lst) > self.hps.max_enc_steps:
             src_lst = src_lst[: self.hps.max_enc_steps]
-        self.enc_lens = len(src_lst)
-        self.enc_input_wids = [src_vocab.word2id(tok) for tok in src_lst]
+        self.enc_len = len(src_lst)
+        self.enc_input = [src_vocab.word2id(tok) for tok in src_lst]
 
         # tokenize the target output
-        tgt_str = ' '.join(tgt_txt)
-        tgt_lst = tgt_str.split()
-        tgt_ids = [tgt_vocab.word2id(tok) for tok in tgt_lst]
+        arg_ids = [tgt_vocab.word2id(tok) for tok in ' '.join(arg_sents).split()]
+        self.arg_dec_input, self.target_arg = self.get_dec_inp_targ_seqs(arg_ids, hps.arg_max_dec_steps,
+                                                                     arg_start_decoding, arg_stop_decoding)
+        self.dec_arg_len = len(self.arg_dec_input)
 
-        self.dec_input_wids, self.target = self.get_dec_inp_targ_seqs(tgt_ids, hps.max_dec_steps, start_decoding, stop_decoding)
-        self.dec_lens = len(self.dec_input_wids)
+        if hps.model in ["sep_dec", "shd_dec"]:
+            kp_ids = [tgt_vocab.word2id(tok) for tok in ['<sent_cs>'] + '</sent_cs> <sent_cs>'.join(kp_sents).split() + ['</sent_cs>']]
+            self.kp_dec_input, self.target_kp = self.get_dec_inp_targ_seqs(kp_ids, hps.kp_max_dec_steps,
+                                                                             kp_start_decoding, kp_stop_decoding)
+            self.dec_kp_len = len(self.kp_dec_input)
 
-        self.original_src = src_txt
-        self.original_tgt = tgt_str
-        self.original_tgt_sents = tgt_txt
-
+        self.original_op = op_txt
+        self.original_evd = evd_txt
+        self.original_src = " ".join(src_lst)
+        self.original_arg = " ".join(arg_sents)
+        self.original_arg_sents = arg_sents
+        self.original_kp = " ".join(kp_sents)
+        self.original_kp_sents = kp_sents
         return
 
     def get_dec_inp_targ_seqs(self, sequence, max_len, start_id, stop_id):
@@ -70,13 +75,17 @@ class DataSample(object):
         assert len(inp) == len(target)
         return inp, target
 
-
-    def pad_decoder_inp_targ(self, max_len, pad_id):
+    def pad_decoder_inp_targ(self, dec_1_max_len, dec_2_max_len, pad_id):
         """Pad decoder input and target sequences with pad_id up to max_len."""
-        while len(self.dec_input) < max_len:
-            self.dec_input.append(pad_id)
-        while len(self.target) < max_len:
-          self.target.append(pad_id)
+        while len(self.arg_dec_input) < dec_1_max_len:
+            self.arg_dec_input.append(pad_id)
+        while len(self.target_arg) < dec_1_max_len:
+            self.target_arg.append(pad_id)
+        if self.hps.model in ["sep_dec", "shd_dec"]:
+            while len(self.kp_dec_input) < dec_2_max_len:
+                self.kp_dec_input.append(pad_id)
+            while len(self.target_kp) < dec_2_max_len:
+                self.target_kp.append(pad_id)
 
 
     def pad_encoder_input(self, max_len, pad_id):
@@ -85,31 +94,95 @@ class DataSample(object):
             self.enc_input.append(pad_id)
 
 
-
-
 class Batch(object):
-  """A class to generate minibatches of data. Buckets examples together based on length of the encoder sequence."""
+  """Class representing a minibatch of train/val/test examples for text summarization."""
 
-  BATCH_QUEUE_MAX = 100 # max number of batches the batch_queue can hold
-
-  def __init__(self, data_path, src_vocab, tgt_vocab, hps, single_pass):
-    """Initialize the batcher. Start threads that process the data into batches.
+  def __init__(self, example_list, hps, src_pad_id, tgt_pad_id):
+    """Turns the example_list into a Batch object.
 
     Args:
-      data_path: tf.Example filepattern.
-      vocab: Vocabulary object
-      hps: hyperparameters
-      single_pass: If True, run through the dataset exactly once (useful for when you want to run evaluation on the dev or test set). Otherwise generate random batches indefinitely (useful for training).
+       example_list: List of Example objects
+       hps: hyperparameters
+       vocab: Vocabulary object
     """
+    self.src_pad_id = src_pad_id # id of the PAD token used to pad sequences
+    self.tgt_pad_id = tgt_pad_id
+    self.init_encoder_seq(example_list, hps) # initialize the input to the encoder
+    self.init_decoder_seq(example_list, hps) # initialize the input and targets for the decoder
+    self.store_orig_strings(example_list, hps) # store the original strings
+
+  def init_encoder_seq(self, example_list, hps):
+    # Determine the maximum length of the encoder input sequence in this batch
+    max_enc_seq_len = max([ex.enc_len for ex in example_list])
+
+    # Pad the encoder input sequences up to the length of the longest sequence
+    for ex in example_list:
+      ex.pad_encoder_input(max_enc_seq_len, self.src_pad_id)
+
+    # Initialize the numpy arrays
+    # Note: our enc_batch can have different length (second dimension) for each batch because we use dynamic_rnn for the encoder.
+    self.enc_batch = np.zeros((hps.batch_size, max_enc_seq_len), dtype=np.int32)
+    self.enc_lens = np.zeros((hps.batch_size), dtype=np.int32)
+    self.enc_padding_mask = np.zeros((hps.batch_size, max_enc_seq_len), dtype=np.float32)
+
+    # Fill in the numpy arrays
+    for i, ex in enumerate(example_list):
+      self.enc_batch[i, :] = ex.enc_input[:]
+      self.enc_lens[i] = ex.enc_len
+      for j in range(ex.enc_len):
+        self.enc_padding_mask[i][j] = 1
+
+
+  def init_decoder_seq(self, example_list, hps):
+    # Pad the inputs and targets
+    for ex in example_list:
+      ex.pad_decoder_inp_targ(hps.arg_max_dec_steps, hps.kp_max_dec_steps, self.tgt_pad_id)
+
+    # Initialize the numpy arrays.
+    # Note: our decoder inputs and targets must be the same length for each batch (second dimension = max_dec_steps) because we do not use a dynamic_rnn for decoding. However I believe this is possible, or will soon be possible, with Tensorflow 1.0, in which case it may be best to upgrade to that.
+    self.arg_dec_batch = np.zeros((hps.batch_size, hps.arg_max_dec_steps), dtype=np.int32)
+    self.arg_target_batch = np.zeros((hps.batch_size, hps.arg_max_dec_steps), dtype=np.int32)
+    self.arg_dec_padding_mask = np.zeros((hps.batch_size, hps.arg_max_dec_steps), dtype=np.float32)
+
+    if hps.model in ["sep_dec", "shd_dec"]:
+        self.kp_dec_batch  = np.zeros((hps.batch_size, hps.kp_max_dec_steps), dtype=np.int32)
+        self.kp_target_batch = np.zeros((hps.batch_size, hps.kp_max_dec_steps), dtype=np.int32)
+        self.kp_dec_padding_mask = np.zeros((hps.batch_size, hps.kp_max_dec_steps), dtype=np.float32)
+
+    # Fill in the numpy arrays
+    for i, ex in enumerate(example_list):
+      self.arg_dec_batch[i, :] = ex.arg_dec_input[:]
+      self.arg_target_batch[i, :] = ex.target_arg[:]
+      for j in range(ex.dec_arg_len):
+        self.arg_dec_padding_mask[i][j] = 1
+      if hps.model in ["sep_dec", "shd_dec"]:
+          self.kp_dec_batch[i, :] = ex.kp_dec_input[:]
+          self.kp_target_batch[i, :] = ex.target_kp[:]
+          for j in range(ex.dec_kp_len):
+            self.kp_dec_padding_mask[i][j] = 1
+
+  def store_orig_strings(self, example_list, hps):
+    self.original_src = [ex.original_src for ex in example_list] # list of lists
+    self.original_arg = [ex.original_arg for ex in example_list] # list of lists
+    self.original_arg_sents = [ex.original_arg_sents for ex in example_list] # list of list of lists
+    if hps.model in ["sep_dec", "shd_dec"]:
+        self.original_kp = [ex.original_kp for ex in example_list]  # list of lists
+        self.original_kp_sents = [ex.original_kp_sents for ex in example_list]  # list of list of lists
+
+class Batcher(object):
+  BATCH_QUEUE_MAX = 100 # max number of batches the batch_queue can hold
+
+  def __init__(self, data_path, src_vocab, tgt_vocab, hps):
     self._data_path = data_path
     self._src_vocab = src_vocab
     self._tgt_vocab = tgt_vocab
     self._hps = hps
+    single_pass = True if hps.mode == "decode" else False
     self._single_pass = single_pass
 
     # Initialize a queue of Batches waiting to be used, and a queue of Examples waiting to be batched
-    self._batch_queue = Queue.Queue(self.BATCH_QUEUE_MAX)
-    self._example_queue = Queue.Queue(self.BATCH_QUEUE_MAX * self._hps.batch_size)
+    self._batch_queue = queue.Queue(self.BATCH_QUEUE_MAX)
+    self._example_queue = queue.Queue(self.BATCH_QUEUE_MAX * self._hps.batch_size)
 
     # Different settings depending on whether we're in single_pass mode or not
     if single_pass:
@@ -124,12 +197,12 @@ class Batch(object):
 
     # Start the threads that load the queues
     self._example_q_threads = []
-    for _ in xrange(self._num_example_q_threads):
+    for _ in range(self._num_example_q_threads):
       self._example_q_threads.append(Thread(target=self.fill_example_queue))
       self._example_q_threads[-1].daemon = True
       self._example_q_threads[-1].start()
     self._batch_q_threads = []
-    for _ in xrange(self._num_batch_q_threads):
+    for _ in range(self._num_batch_q_threads):
       self._batch_q_threads.append(Thread(target=self.fill_batch_queue))
       self._batch_q_threads[-1].daemon = True
       self._batch_q_threads[-1].start()
@@ -142,13 +215,6 @@ class Batch(object):
 
 
   def next_batch(self):
-    """Return a Batch from the batch queue.
-
-    If mode='decode' then each batch contains a single example repeated beam_size-many times; this is necessary for beam search.
-
-    Returns:
-      batch: a Batch object, or None if we're in single_pass mode and we've exhausted the dataset.
-    """
     # If the batch queue is empty, print a warning
     if self._batch_queue.qsize() == 0:
       tf.logging.warning('Bucket input queue is empty when calling next_batch. Bucket queue size: %i, Input queue size: %i', self._batch_queue.qsize(), self._example_queue.qsize())
@@ -160,13 +226,11 @@ class Batch(object):
     return batch
 
   def fill_example_queue(self):
-    """Reads data from file and processes into Examples which are then placed into the example queue."""
-
     input_gen = self.text_generator(utils.example_generator(self._data_path, self._single_pass))
 
     while True:
       try:
-        (article, abstract) = input_gen.next() # read the next example from file. article and abstract are both strings.
+        (op, evd, kp, arg) = next(input_gen) # read the next example from file. article and abstract are both strings.
       except StopIteration: # if there are no more examples:
         tf.logging.info("The example generator for this example queue filling thread has exhausted data.")
         if self._single_pass:
@@ -176,27 +240,24 @@ class Batch(object):
         else:
           raise Exception("single_pass mode is off but the example generator is out of data; error.")
 
-      abstract_sentences = [sent.strip() for sent in utils.abstract2sents(abstract)] # Use the <s> and </s> tags in abstract to get a list of sentences.
-      example = DataSample(article, abstract_sentences, self._src_vocab, self._tgt_vocab, self._hps) # Process into an Example.
+      kp_sents = [sent.strip() for sent in utils.split_sent(kp, "kp")]
+      arg_sents = [sent.strip() for sent in utils.split_sent(arg, "arg")]
+      example = DataSample(op, evd, kp_sents, arg_sents, self._src_vocab, self._tgt_vocab, self._hps) # Process into an Example.
       self._example_queue.put(example) # place the Example in the example queue.
 
 
   def fill_batch_queue(self):
-    """Takes Examples out of example queue, sorts them by encoder sequence length, processes into Batches and places them in the batch queue.
-
-    In decode mode, makes batches that each contain a single example repeated.
-    """
     while True:
       if self._hps.mode != 'decode':
         # Get bucketing_cache_size-many batches of Examples into a list, then sort
         inputs = []
-        for _ in xrange(self._hps.batch_size * self._bucketing_cache_size):
+        for _ in range(self._hps.batch_size * self._bucketing_cache_size):
           inputs.append(self._example_queue.get())
         inputs = sorted(inputs, key=lambda inp: inp.enc_len) # sort by length of encoder sequence
 
         # Group the sorted Examples into batches, optionally shuffle the batches, and place in the batch queue.
         batches = []
-        for i in xrange(0, len(inputs), self._hps.batch_size):
+        for i in range(0, len(inputs), self._hps.batch_size):
           batches.append(inputs[i:i + self._hps.batch_size])
         if not self._single_pass:
           shuffle(batches)
@@ -205,12 +266,11 @@ class Batch(object):
 
       else: # beam search decode mode
         ex = self._example_queue.get()
-        b = [ex for _ in xrange(self._hps.batch_size)]
+        b = [ex for _ in range(self._hps.batch_size)]
         self._batch_queue.put(Batch(b, self._hps, self._src_vocab.word2id(utils.PAD_TOKEN), self._tgt_vocab.word2id(utils.PAD_TOKEN)))
 
 
   def watch_threads(self):
-    """Watch example queue and batch queue threads and restart if dead."""
     while True:
       time.sleep(60)
       for idx,t in enumerate(self._example_q_threads):
@@ -230,19 +290,17 @@ class Batch(object):
 
 
   def text_generator(self, example_generator):
-    """Generates article and abstract text from tf.Example.
-
-    Args:
-      example_generator: a generator of tf.Examples from file. See data.example_generator"""
     while True:
-      e = example_generator.next() # e is a tf.Example
+      e = next(example_generator) # e is a tf.Example
       try:
-        article_text = e.features.feature['article'].bytes_list.value[0] # the article text was saved under the key 'article' in the data files
-        abstract_text = e.features.feature['abstract'].bytes_list.value[0] # the abstract text was saved under the key 'abstract' in the data files
+        op_text = e.features.feature['op'].bytes_list.value[0].decode()
+        evd_text = e.features.feature['evd'].bytes_list.value[0].decode()
+        kp_text = e.features.feature['kp'].bytes_list.value[0].decode()
+        arg_text = e.features.feature['arg'].bytes_list.value[0].decode()
       except ValueError:
         tf.logging.error('Failed to get article or abstract from example')
         continue
-      if len(article_text)==0: # See https://github.com/abisee/pointer-generator/issues/1
+      if len(op_text)==0:
         tf.logging.warning('Found an example with empty article text. Skipping it.')
       else:
-        yield (article_text, abstract_text)
+        yield ( op_text, evd_text, kp_text, arg_text )
