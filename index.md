@@ -13,7 +13,10 @@ This repository holds the code for Neural Argument Generation project developed 
 - numpy 1.14
 
 ### Data
-Please download the dataset from [here](https://drive.google.com/file/d/1qyFP9zi9PMvQI7hERoP-X1YHly1dw9Fw/view?usp=sharing).
+
+**Update**: _This dataset has been updated on 2018/08/23. This change solves some tokenization errors exist in previous version._
+
+Please download the dataset from [here](https://drive.google.com/file/d/1Vfn8TWmtts_NneGNpd-aqQEJDqt5J6c6/view?usp=sharing).
 
 The dataset consists of the following 5 parts:
 
