@@ -47,7 +47,6 @@ def create_bin(path, data_split):
             str_len = len(tf_example_str)
             fout.write(struct.pack('q', str_len))
             fout.write(struct.pack('%ds' % str_len, tf_example_str))
-            if idx > 10:break
     return
 
 
