@@ -15,7 +15,7 @@ import argparse
 parser = argparse.ArgumentParser(description="Entry for neural argument generation.")
 
 # path for data and model storage
-parser.add_argument("--data_path", type=str, default="dat/trainable/train.bin", help="Path to binarized train/valid/test data.")
+parser.add_argument("--data_path", type=str, default="dat/trainable/bin/train.bin", help="Path to binarized train/valid/test data.")
 parser.add_argument("--src_vocab_path", type=str, default="dat/vocab.src", help="Path to source vocabulary.")
 parser.add_argument("--tgt_vocab_path", type=str, default="dat/vocab.tgt", help="Path to target vocabulary.")
 parser.add_argument("--embed_path", type=str, default="dat/embedding/glove/glove.6B.200d.txt", help="Path to word embedding.")
